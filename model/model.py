@@ -33,18 +33,36 @@ def precompute_pos_cis(dim: int, end: int = int(32 * 1024), theta: float = 1e6):
 
 
 def apply_rotary_emb(xq, xk, pos_cis):
-    def unite_shape(pos_cis, x):
+    def unite_shape(pos_cis, x):#首先调整形状
+        """
+        调整位置编码的形状以匹配输入张量的维度
+        
+        Args:
+            pos_cis: 位置编码张量
+            x: 输入张量
+            
+        Returns:
+            调整后的位置编码张量
+            
+        注意:
+            - 确保输入张量至少有2个维度
+            - pos_cis的形状需要与x的第2维和最后一维匹配
+        """
         ndim = x.ndim
         assert 0 <= 1 < ndim
-        assert pos_cis.shape == (x.shape[1], x.shape[-1])
+        assert pos_cis.shape == (x.shape[1], x.shape[-1])#分别表示序列长度和维度
         shape = [d if i == 1 or i == ndim - 1 else 1 for i, d in enumerate(x.shape)]
         return pos_cis.view(*shape)
 
+    # 将query和key转换为复数形式
     xq_ = torch.view_as_complex(xq.float().reshape(*xq.shape[:-1], -1, 2))
     xk_ = torch.view_as_complex(xk.float().reshape(*xk.shape[:-1], -1, 2))
+    # 调整位置编码形状
     pos_cis = unite_shape(pos_cis, xq_)
+    # 应用旋转位置编码并转回实数形式。flatten(3)表示将最后一维展平
     xq_out = torch.view_as_real(xq_ * pos_cis).flatten(3)
     xk_out = torch.view_as_real(xk_ * pos_cis).flatten(3)
+    # 返回与输入相同数据类型的结果
     return xq_out.type_as(xq), xk_out.type_as(xk)
 
 
@@ -60,82 +78,105 @@ def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
     )
 
 
-class Attention(nn.Module):
+class Attention(nn.Module):#注意力层
     def __init__(self, args: LMConfig):
+        # 调用父类初始化
         super().__init__()
+        # 设置key-value头的数量,如果未指定则等于注意力头数量
         self.n_kv_heads = args.n_heads if args.n_kv_heads is None else args.n_kv_heads
+        # 确保注意力头数量能被kv头数量整除
         assert args.n_heads % self.n_kv_heads == 0
+        # 设置本地注意力头数量
         self.n_local_heads = args.n_heads
         self.n_local_kv_heads = self.n_kv_heads
+        # 计算每个kv头对应的注意力头数量
         self.n_rep = self.n_local_heads // self.n_local_kv_heads
+        # 计算每个头的维度
         self.head_dim = args.dim // args.n_heads
-        self.wq = nn.Linear(args.dim, args.n_heads * self.head_dim, bias=False)
-        self.wk = nn.Linear(args.dim, self.n_kv_heads * self.head_dim, bias=False)
-        self.wv = nn.Linear(args.dim, self.n_kv_heads * self.head_dim, bias=False)
+        # 定义Q、K、V的线性变换层
+        self.wq = nn.Linear(args.dim, args.n_heads * self.head_dim, bias=False)#q的大小是头的数量*头的维度
+        self.wk = nn.Linear(args.dim, self.n_kv_heads * self.head_dim, bias=False)#k的大小是kv头的数量*头的维度
+        self.wv = nn.Linear(args.dim, self.n_kv_heads * self.head_dim, bias=False)#v的大小是kv头的数量*头的维度
+        # 定义输出的线性变换层
         self.wo = nn.Linear(args.n_heads * self.head_dim, args.dim, bias=False)
+        # 定义注意力和残差的dropout层
         self.attn_dropout = nn.Dropout(args.dropout)
         self.resid_dropout = nn.Dropout(args.dropout)
         self.dropout = args.dropout
+        # 判断是否使用flash attention加速
         self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention') and args.flash_attn
-        # print("WARNING: using slow attention. Flash Attention requires PyTorch >= 2.0")
-        mask = torch.full((1, 1, args.max_seq_len, args.max_seq_len), float("-inf"))
-        mask = torch.triu(mask, diagonal=1)
-        self.register_buffer("mask", mask, persistent=False)
+        # 创建注意力掩码矩阵,用于实现因果注意力
+        mask = torch.full((1, 1, args.max_seq_len, args.max_seq_len), float("-inf"))#值为-无穷
+        mask = torch.triu(mask, diagonal=1)#只保留原来的上三角部分，其余变成0
+        self.register_buffer("mask", mask, persistent=False)#把mask注册到buffer中，这样在反向传播时不会被更新
 
     def forward(self,
                 x: torch.Tensor,
                 pos_cis: torch.Tensor,
                 past_key_value: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
                 use_cache=False):
-        bsz, seq_len, _ = x.shape
-        xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
-        xq = xq.view(bsz, seq_len, self.n_local_heads, self.head_dim)
+        bsz, seq_len, _ = x.shape#得到batch_size,序列长度,维度
+        xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)#输入x，得到q、k、v
+        xq = xq.view(bsz, seq_len, self.n_local_heads, self.head_dim)#转换成batch_size,序列长度,头的数量,头的维度
         xk = xk.view(bsz, seq_len, self.n_local_kv_heads, self.head_dim)
         xv = xv.view(bsz, seq_len, self.n_local_kv_heads, self.head_dim)
 
-        xq, xk = apply_rotary_emb(xq, xk, pos_cis)
+        xq, xk = apply_rotary_emb(xq, xk, pos_cis)#给q、k添加位置编码
         # kv_cache实现
-        if past_key_value is not None:
+        if past_key_value is not None:#在k、v中添加past_key_value
             xk = torch.cat([past_key_value[0], xk], dim=1)
             xv = torch.cat([past_key_value[1], xv], dim=1)
         past_kv = (xk, xv) if use_cache else None
 
         xq, xk, xv = (
-            xq.transpose(1, 2),
-            repeat_kv(xk, self.n_rep).transpose(1, 2),
+            xq.transpose(1, 2),# q的维度转换成batch_size,头的数量,序列长度,头的维度
+            # transpose表示对调维度
+            repeat_kv(xk, self.n_rep).transpose(1, 2),#每个kv头会分到好几个注意力头，所以要重复
             repeat_kv(xv, self.n_rep).transpose(1, 2)
         )
         if self.flash and seq_len != 1:
-            dropout_p = self.dropout if self.training else 0.0
-            output = F.scaled_dot_product_attention(
+            dropout_p = self.dropout if self.training else 0.0#如果是训练阶段，就使用dropout，否则使用0.0
+            output = F.scaled_dot_product_attention(#F来自torch.nn.functional
                 xq, xk, xv,
                 attn_mask=None,
                 dropout_p=dropout_p,
-                is_causal=True
+                is_causal=True#是否是因果注意力
             )
         else:
-            scores = (xq @ xk.transpose(-2, -1)) / math.sqrt(self.head_dim)
-            scores += self.mask[:, :, :seq_len, :seq_len]
-            scores = F.softmax(scores.float(), dim=-1).type_as(xq)
-            scores = self.attn_dropout(scores)
-            output = scores @ xv
+            # 手动计算注意力
+            scores = (xq @ xk.transpose(-2, -1)) / math.sqrt(self.head_dim)# 把q和k的转置矩阵相乘
+            scores += self.mask[:, :, :seq_len, :seq_len]# 把掩码添加到scores中
+            scores = F.softmax(scores.float(), dim=-1).type_as(xq)#对最后一个维度进行softmax
+            scores = self.attn_dropout(scores)#对scores进行dropout
+            output = scores @ xv#最后是计算q和v的乘积
 
-        output = output.transpose(1, 2).reshape(bsz, seq_len, -1)
-        output = self.resid_dropout(self.wo(output))
+        output = output.transpose(1, 2).reshape(bsz, seq_len, -1)#把输出转换成batch_size,序列长度,维度
+        output = self.resid_dropout(self.wo(output))#进行output，然后进行dropout
         return output, past_kv
 
 
 class FeedForward(nn.Module):
     def __init__(self, config: LMConfig):
+        """
+        前馈神经网络模块初始化
+        
+        Args:
+            config: LMConfig - 模型配置参数对象
+            
+        初始化内容:
+            1. 如果未指定hidden_dim，则根据dim计算合适的隐藏层维度
+            2. 创建三个线性变换层(w1, w2, w3)用于SwiGLU激活函数实现
+            3. 设置dropout层用于正则化
+        """
         super().__init__()
         if config.hidden_dim is None:
-            hidden_dim = 4 * config.dim
-            hidden_dim = int(2 * hidden_dim / 3)
-            config.hidden_dim = config.multiple_of * ((hidden_dim + config.multiple_of - 1) // config.multiple_of)
-        self.w1 = nn.Linear(config.dim, config.hidden_dim, bias=False)
-        self.w2 = nn.Linear(config.hidden_dim, config.dim, bias=False)
-        self.w3 = nn.Linear(config.dim, config.hidden_dim, bias=False)
-        self.dropout = nn.Dropout(config.dropout)
+            hidden_dim = 4 * config.dim  # 初始隐藏层大小为输入维度的4倍
+            hidden_dim = int(2 * hidden_dim / 3)  # 缩小到原来的2/3
+            config.hidden_dim = config.multiple_of * ((hidden_dim + config.multiple_of - 1) // config.multiple_of)  # 向上取整到最近的倍数
+        self.w1 = nn.Linear(config.dim, config.hidden_dim, bias=False)  # 输入投影层
+        self.w2 = nn.Linear(config.hidden_dim, config.dim, bias=False)  # 输出投影层
+        self.w3 = nn.Linear(config.dim, config.hidden_dim, bias=False)  # 门控投影层
+        self.dropout = nn.Dropout(config.dropout)  # dropout层用于防止过拟合
 
     def forward(self, x):
         return self.dropout(self.w2(F.silu(self.w1(x)) * self.w3(x)))
@@ -260,26 +301,41 @@ class MOEFeedForward(nn.Module):
 
 class MiniMindBlock(nn.Module):
     def __init__(self, layer_id: int, config: LMConfig):
+        """
+        MiniMindBlock的初始化函数
+        
+        Args:
+            layer_id: 当前层的ID
+            config: 模型配置参数
+            
+        初始化内容包括:
+        1. 多头注意力相关参数(n_heads, dim, head_dim)
+        2. 注意力层(Attention)
+        3. 两个归一化层(attention_norm, ffn_norm) 
+        4. 前馈网络层(feed_forward或MOEFeedForward)
+        """
         super().__init__()
         self.n_heads = config.n_heads
         self.dim = config.dim
         self.head_dim = config.dim // config.n_heads
-        self.attention = Attention(config)
+        self.attention = Attention(config)#自定义的Attention
 
         self.layer_id = layer_id
         self.attention_norm = RMSNorm(config.dim, eps=config.norm_eps)
         self.ffn_norm = RMSNorm(config.dim, eps=config.norm_eps)
+        # 两种前馈网络都是自定义的
         self.feed_forward = FeedForward(config) if not config.use_moe else MOEFeedForward(config)
+
 
     def forward(self, x, pos_cis, past_key_value=None, use_cache=False):
         h_attn, past_kv = self.attention(
-            self.attention_norm(x),
+            self.attention_norm(x),#先归一化再做注意力
             pos_cis,
             past_key_value=past_key_value,
             use_cache=use_cache
         )
-        h = x + h_attn
-        out = h + self.feed_forward(self.ffn_norm(h))
+        h = x + h_attn#加入注意力层，再残差连接
+        out = h + self.feed_forward(self.ffn_norm(h))#先归一化再加入前馈网络层，最后残差连接
         return out, past_kv
 
 
@@ -332,7 +388,7 @@ class MiniMindLM(PreTrainedModel):#预训练大模型
         self.OUT.__setitem__('past_key_values', past_kvs)
         return self.OUT
 
-    @torch.inference_mode()
+    @torch.inference_mode()#表示在推理模式下（而非训练模式）运行，即不跟踪梯度
     def generate(self, input_ids, eos_token_id=2, max_new_tokens=1024, temperature=0.75, top_p=0.90,
                  stream=False, rp=1., use_cache=True, pad_token_id=0, **args):
         # 流式生成
@@ -341,44 +397,90 @@ class MiniMindLM(PreTrainedModel):#预训练大模型
 
         # 直接生成
         generated = []
-        for i in range(input_ids.size(0)):
+        for i in range(input_ids.size(0)):#遍历每一个batch
+            # 提取非padding的有效token序列，然后在第0维增加一个维度
             non_pad = input_ids[i][input_ids[i] != pad_token_id].unsqueeze(0)
+            # 调用_stream方法生成新的token序列
             out = self._stream(non_pad, eos_token_id, max_new_tokens, temperature, top_p, rp, use_cache, **args)
+            # 只保留每个生成步骤的最后一个token
             tokens_list = [tokens[:, -1:] for tokens in out]
+            # 将生成的token在最后一个维度拼接起来,形成完整token，如果没有生成则使用原序列
             gen = torch.cat(tokens_list, dim=-1) if tokens_list else non_pad
+            # 将non_pad和生成的序列拼接，然后放入generated列表
             full_sequence = torch.cat([non_pad, gen], dim=-1)
             generated.append(full_sequence)
+        # 找到最长序列的长度
         max_length = max(seq.size(1) for seq in generated)
+        # 对所有序列进行padding,使其长度一致
         generated = [
-            torch.cat(
+            torch.cat(#用pad_token_id填充
                 [seq, torch.full((1, max_length - seq.size(1)), pad_token_id, dtype=seq.dtype, device=seq.device)],
                 dim=-1)
             for seq in generated
         ]
+        # 将generated数组的所有序列在batch维度上拼接
         return torch.cat(generated, dim=0)
 
     def _stream(self, input_ids, eos_token_id, max_new_tokens, temperature, top_p, rp, use_cache, **args):
+        """
+        流式生成文本的核心方法
+        
+        Args:
+            input_ids: 输入的token id序列
+            eos_token_id: 结束符token的id
+            max_new_tokens: 最大生成的新token数量
+            temperature: 采样温度,控制生成的随机性
+            top_p: 核采样的概率阈值
+            rp: 重复惩罚因子
+            use_cache: 是否使用KV缓存
+            **args: 其他参数
+            
+        Yields:
+            torch.Tensor: 每一步生成的token序列
+            
+        实现逻辑:
+        1. 初始化起始位置和KV缓存
+        2. 循环生成,直到达到最大长度或生成结束符:
+           - 第一次或不使用缓存时,处理整个序列
+           - 后续只处理最新生成的token
+           - 对logits进行温度缩放和重复惩罚
+           - 使用top_p采样生成下一个token
+        """
         start, first_seq, past_kvs = input_ids.shape[1], True, None
-        while input_ids.shape[1] < max_new_tokens - 1:
+        while input_ids.shape[1] < max_new_tokens - 1:#这里的shape[1]表示序列的长度
+            # 第一次或不使用缓存时,处理整个序列
             if first_seq or not use_cache:
                 out, first_seq = self(input_ids, past_key_values=past_kvs, use_cache=use_cache, **args), False
             else:
+                # 只处理最新生成的token
                 out = self(input_ids[:, -1:], past_key_values=past_kvs, use_cache=use_cache,
                            start_pos=input_ids.shape[1] - 1, **args)
             logits, past_kvs = out.logits[:, -1, :], out.past_key_values
+            # 对已生成的token进行重复惩罚，rp是超参数，[0]表示第一个样本
             logits[:, list(set(input_ids.tolist()[0]))] /= rp
+            # 温度缩放
             logits /= (temperature + 1e-9)
+            # 使用top_p采样
             if top_p is not None and top_p < 1.0:
+                # 对logits进行降序排序，得到排序后的logits和对应的索引
                 sorted_logits, sorted_indices = torch.sort(logits, descending=True, dim=-1)
+                # 对排序后的logits进行softmax得到概率分布
                 sorted_probs = F.softmax(sorted_logits, dim=-1)
+                # 计算累积概率，每个元素表示从第一个 token 到当前 token 的概率总和
                 cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
+                # 找出累积概率大于top_p的位置
                 sorted_indices_to_remove = cumulative_probs > top_p
+                # 将需要移除的索引向前移动一位，保留第一个token
                 sorted_indices_to_remove[:, 1:] = sorted_indices_to_remove[:, :-1].clone()
-                sorted_indices_to_remove[:, 0] = False
+                sorted_indices_to_remove[:, 0] = False#把第一个设置为False
+                # 将刚才的布尔值映射回原始顺序
                 indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)
+                # 将需要移除的位置的logits设为负无穷
                 logits[indices_to_remove] = -float('Inf')
-            input_ids_next = torch.multinomial(F.softmax(logits, dim=-1), num_samples=1)
-            input_ids = torch.cat((input_ids, input_ids_next), dim=1)
-            yield input_ids[:, start:]
+            # 采样生成下一个token
+            input_ids_next = torch.multinomial(F.softmax(logits, dim=-1), num_samples=1)#默认不放回采样
+            input_ids = torch.cat((input_ids, input_ids_next), dim=1)#连接到input_ids
+            yield input_ids[:, start:]#这里start是序列长度，所以这里返回了最新的token
+            # 如果生成了结束符则停止
             if input_ids_next.item() == eos_token_id:
                 break
