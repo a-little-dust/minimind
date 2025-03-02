@@ -27,42 +27,43 @@ def Logger(content):
         print(content)
 
 
-def get_lr(current_step, total_steps, lr):
+def get_lr(current_step, total_steps, lr):#根据当前step和总step数计算学习率
     return lr / 10 + 0.5 * lr * (1 + math.cos(math.pi * current_step / total_steps))
 
 
 def train_epoch(epoch, wandb):
-    loss_fct = nn.CrossEntropyLoss(reduction='none')
+    loss_fct = nn.CrossEntropyLoss(reduction='none')#交叉熵，是自定义的
     start_time = time.time()
-    for step, (X, Y, loss_mask) in enumerate(train_loader):
+    for step, (X, Y, loss_mask) in enumerate(train_loader):#从加载器得到x,y,loss_mask
         X = X.to(args.device)
         Y = Y.to(args.device)
         loss_mask = loss_mask.to(args.device)
-
+# 学习率的第一个参数是当前step，第二个参数是总step数，第三个参数是学习率
         lr = get_lr(epoch * iter_per_epoch + step, args.epochs * iter_per_epoch, args.learning_rate)
         for param_group in optimizer.param_groups:
-            param_group['lr'] = lr
+            param_group['lr'] = lr#给优化器的每个参数组设置学习率
 
         with ctx:
-            res = model(X)
+            res = model(X) # 得到模型输出
             loss = loss_fct(
                 res.logits.view(-1, res.logits.size(-1)),
                 Y.view(-1)
-            ).view(Y.size())
-            loss = (loss * loss_mask).sum() / loss_mask.sum()
-            loss += res.aux_loss
-            loss = loss / args.accumulation_steps
+            ).view(Y.size())#计算损失，然后恢复到y的形状
+            loss = (loss * loss_mask).sum() / loss_mask.sum()#根据loss_mask对损失进行加权，然后平均
+            loss += res.aux_loss#加上辅助损失
+            loss = loss / args.accumulation_steps#把损失平均到每个step
 
-        scaler.scale(loss).backward()
+        scaler.scale(loss).backward()#对loss做缩放，然后进行梯度的反向传播
 
-        if (step + 1) % args.accumulation_steps == 0:
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+        if (step + 1) % args.accumulation_steps == 0: # 当累积足够的梯度步数时执行参数更新
+            scaler.unscale_(optimizer) # 将梯度从FP16缩放回FP32
+            torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip) # 梯度裁剪，防止梯度爆炸
+            # 这里grad_clip的值是0.5，表示梯度不能超过0.5
 
-            scaler.step(optimizer)
-            scaler.update()
+            scaler.step(optimizer) # 执行优化器的参数更新步骤
+            scaler.update() # 根据是否出现梯度溢出来更新scaler的比例因子
 
-            optimizer.zero_grad(set_to_none=True)
+            optimizer.zero_grad(set_to_none=True) # 清空累积的梯度，set_to_none=True可以节省内存
 
         if step % args.log_interval == 0:
             spend_time = time.time() - start_time
@@ -72,17 +73,17 @@ def train_epoch(epoch, wandb):
                     args.epochs,
                     step,
                     iter_per_epoch,
-                    loss.item() * args.accumulation_steps,
+                    loss.item() * args.accumulation_steps,#损失等于所有累积梯度步数的损失
                     optimizer.param_groups[-1]['lr'],
                     spend_time / (step + 1) * iter_per_epoch // 60 - spend_time // 60))
 
-            if (wandb is not None) and (not ddp or dist.get_rank() == 0):
-                wandb.log({"loss": loss.item() * args.accumulation_steps,
+            if (wandb is not None) and (not ddp or dist.get_rank() == 0):#如果是分布式训练，且当前进程是主进程
+                wandb.log({"loss": loss.item() * args.accumulation_steps,#记录到wandb中
                            "lr": optimizer.param_groups[-1]['lr'],
                            "epoch_Time": spend_time / (step + 1) * iter_per_epoch // 60 - spend_time // 60})
 
         if (step + 1) % args.save_interval == 0 and (not ddp or dist.get_rank() == 0):
-            model.eval()
+            model.eval()#把模型设置为评估模式
             moe_path = '_moe' if lm_config.use_moe else ''
             ckp = f'{args.save_dir}/pretrain_{lm_config.dim}{moe_path}.pth'
 
@@ -91,12 +92,12 @@ def train_epoch(epoch, wandb):
             else:
                 state_dict = model.state_dict()
 
-            torch.save(state_dict, ckp)
-            model.train()
+            torch.save(state_dict, ckp)#把state_dict保存到文件中
+            model.train()#把模型设置为训练模式
 
 
-def init_model(lm_config):
-    tokenizer = AutoTokenizer.from_pretrained('./model/minimind_tokenizer')
+def init_model(lm_config):#初始化模型
+    tokenizer = AutoTokenizer.from_pretrained('./model/minimind_tokenizer')#加载分词器
     model = MiniMindLM(lm_config).to(args.device)
     Logger(f'LLM总参数量：{sum(p.numel() for p in model.parameters() if p.requires_grad) / 1e6:.3f} 百万')
     return model, tokenizer
@@ -116,72 +117,74 @@ def init_distributed_mode():
 
 # torchrun --nproc_per_node 2 1-pretrain.py
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="MiniMind Pretraining")
+    parser = argparse.ArgumentParser(description="MiniMind Pretraining")#这是系统的
     parser.add_argument("--out_dir", type=str, default="out")
     # 若要以最快速度实现zero则epochs设置为1轮；否则应当利用有限的数据训练2~6个epochs。
     parser.add_argument("--epochs", type=int, default=1)
-    parser.add_argument("--batch_size", type=int, default=32)
+    parser.add_argument("--batch_size", type=int, default=32)#一个批次有多少数据
     parser.add_argument("--learning_rate", type=float, default=5e-4)
-    parser.add_argument("--device", type=str, default="cuda:0" if torch.cuda.is_available() else "cpu")
-    parser.add_argument("--dtype", type=str, default="bfloat16")
+    parser.add_argument("--device", type=str, default="cuda:0" if torch.cuda.is_available() else "cpu")#默认选择第一个cuda
+    parser.add_argument("--dtype", type=str, default="bfloat16")#这里选择bf16。相比fp16，这种数据精度低但范围大
     parser.add_argument("--use_wandb", action="store_true")
     parser.add_argument("--wandb_project", type=str, default="MiniMind-Pretrain")
-    parser.add_argument("--num_workers", type=int, default=1)
-    parser.add_argument("--ddp", action="store_true")
-    parser.add_argument("--accumulation_steps", type=int, default=8)
-    parser.add_argument("--grad_clip", type=float, default=1.0)
-    parser.add_argument("--warmup_iters", type=int, default=0)
-    parser.add_argument("--log_interval", type=int, default=100)
+    parser.add_argument("--num_workers", type=int, default=1)#加载数据的时候的线程数
+    parser.add_argument("--ddp", action="store_true")#是否使用分布式
+    parser.add_argument("--accumulation_steps", type=int, default=8)#在进行一次参数更新之前，进行 8 次前向、反向传播
+    parser.add_argument("--grad_clip", type=float, default=1.0)#梯度裁剪的阈值
+    parser.add_argument("--warmup_iters", type=int, default=0)#学习率从零开始，经过多个迭代以后到达稳定值，预热结束
+    parser.add_argument("--log_interval", type=int, default=100)#多少个迭代打印一次
     parser.add_argument("--save_interval", type=int, default=100)
-    parser.add_argument('--local_rank', type=int, default=-1)
-    parser.add_argument('--dim', default=512, type=int)
-    parser.add_argument('--n_layers', default=8, type=int)
+    parser.add_argument('--local_rank', type=int, default=-1)#使用的gpu
+    parser.add_argument('--dim', default=512, type=int)#隐藏层的维度
+    parser.add_argument('--n_layers', default=8, type=int)#多少个层
     parser.add_argument('--max_seq_len', default=512, type=int)
-    parser.add_argument('--use_moe', default=False, type=bool)
+    parser.add_argument('--use_moe', default=False, type=bool)#是否采用混合专家模式
     parser.add_argument("--data_path", type=str, default="./dataset/pretrain_hq.jsonl")
     args = parser.parse_args()
 
+    #使用args的参数给lm_config赋值
     lm_config = LMConfig(dim=args.dim, n_layers=args.n_layers, max_seq_len=args.max_seq_len, use_moe=args.use_moe)
     args.save_dir = os.path.join(args.out_dir)
     os.makedirs(args.save_dir, exist_ok=True)
     os.makedirs(args.out_dir, exist_ok=True)
-    tokens_per_iter = args.batch_size * lm_config.max_seq_len
+    tokens_per_iter = args.batch_size * lm_config.max_seq_len#每次迭代要处理的token数
     torch.manual_seed(1337)
     device_type = "cuda" if "cuda" in args.device else "cpu"
-
+    #设置在wandb中的名字
     args.wandb_run_name = f"MiniMind-Pretrain-Epoch-{args.epochs}-BatchSize-{args.batch_size}-LearningRate-{args.learning_rate}"
 
-    ctx = nullcontext() if device_type == "cpu" else torch.cuda.amp.autocast()
+    ctx = nullcontext() if device_type == "cpu" else torch.cuda.amp.autocast()#如果在gpu，就启用自动混合精度训练（也就是 32 位和 16 位混合）
 
-    ddp = int(os.environ.get("RANK", -1)) != -1  # is this a ddp run?
+    ddp = int(os.environ.get("RANK", -1)) != -1  # 如果RANK不为-1,说明是分布式训练环境，ddp为True
     ddp_local_rank, DEVICE = 0, "cuda:0"
 
     if ddp:
-        init_distributed_mode()
-        args.device = torch.device(DEVICE)
+        init_distributed_mode()#初始化分布式训练环境
+        args.device = torch.device(DEVICE)#把DEVICE参数传到torch.device，构建设备
 
     if args.use_wandb and (not ddp or ddp_local_rank == 0):
         import wandb
-
         wandb.init(project=args.wandb_project, name=args.wandb_run_name)
     else:
         wandb = None
 
-    model, tokenizer = init_model(lm_config)
+    model, tokenizer = init_model(lm_config)#根据lm_config初始化模型和tokenizer
+    # 利用tokenizer把数据转换成模型可以接受的格式
     train_ds = PretrainDataset(args.data_path, tokenizer, max_length=lm_config.max_seq_len)
+    #DistributedSampler是PyTorch 提供的一个类
     train_sampler = DistributedSampler(train_ds) if ddp else None
     train_loader = DataLoader(
-        train_ds,
+        train_ds,#数据集
         batch_size=args.batch_size,
-        pin_memory=True,
-        drop_last=False,
+        pin_memory=True,#设为true表示数据放在固定内存
+        drop_last=False,#false表示最后一个批次不丢弃
         shuffle=False,
         num_workers=args.num_workers,
         sampler=train_sampler
     )
-
+    #在反向传播过程中对损失进行缩放，从而避免梯度下溢，然后在更新参数之前再将梯度缩放回原始比例
     scaler = torch.cuda.amp.GradScaler(enabled=(args.dtype in ['float16', 'bfloat16']))
-    optimizer = optim.AdamW(model.parameters(), lr=args.learning_rate)
+    optimizer = optim.AdamW(model.parameters(), lr=args.learning_rate)#用AdamW优化器，引入了权重衰减正则化项，有助于防止模型过拟合
 
     if ddp:
         model._ddp_params_and_buffers_to_ignore = {"pos_cis"}
@@ -189,4 +192,5 @@ if __name__ == "__main__":
 
     iter_per_epoch = len(train_loader)
     for epoch in range(args.epochs):
-        train_epoch(epoch, wandb)
+        train_epoch(epoch, wandb)#训练一个epoch
+   

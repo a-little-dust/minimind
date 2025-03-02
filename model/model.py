@@ -12,22 +12,23 @@ from torch import nn
 from transformers import PreTrainedModel
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
-
+#归一化
 class RMSNorm(torch.nn.Module):
     def __init__(self, dim: int, eps: float):
         super().__init__()
         self.eps = eps
-        self.weight = nn.Parameter(torch.ones(dim))
+        self.weight = nn.Parameter(torch.ones(dim))#创建一个维度为dim的全1向量。Parameter表示这是一个可训练的参数，在反向传播时会被更新
 
     def forward(self, x):
         return self.weight * (x.float() * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)).type_as(x)
 
-
+# 计算rotate位置编码
 def precompute_pos_cis(dim: int, end: int = int(32 * 1024), theta: float = 1e6):
     freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
-    t = torch.arange(end, device=freqs.device)  # type: ignore
-    freqs = torch.outer(t, freqs).float()  # type: ignore
-    pos_cis = torch.polar(torch.ones_like(freqs), freqs)  # complex64
+    t = torch.arange(end, device=freqs.device)  # 生成一个从 0 到 end-1 的张量
+    freqs = torch.outer(t, freqs).float()  # 计算 t 和 freqs 的外积
+    pos_cis = torch.polar(torch.ones_like(freqs), freqs)  # 先得到一个形状为freqs的全是 1的张量，表示极坐标的振幅
+    # 然后使用freqs作为极坐标的角度
     return pos_cis
 
 
@@ -282,42 +283,49 @@ class MiniMindBlock(nn.Module):
         return out, past_kv
 
 
-class MiniMindLM(PreTrainedModel):
+class MiniMindLM(PreTrainedModel):#预训练大模型
     config_class = LMConfig
 
     def __init__(self, params: LMConfig = None):
-        self.params = params or LMConfig()
+        self.params = params or LMConfig()#从LMConfig中读取params
         super().__init__(self.params)
         self.vocab_size, self.n_layers = params.vocab_size, params.n_layers
-        self.tok_embeddings = nn.Embedding(params.vocab_size, params.dim)
-        self.dropout = nn.Dropout(params.dropout)
-        self.layers = nn.ModuleList([MiniMindBlock(l, params) for l in range(self.n_layers)])
-        self.norm = RMSNorm(params.dim, eps=params.norm_eps)
-        self.output = nn.Linear(params.dim, params.vocab_size, bias=False)
-        self.tok_embeddings.weight = self.output.weight
+        self.tok_embeddings = nn.Embedding(params.vocab_size, params.dim)#输入层，把词汇表映射为embedding
+        self.dropout = nn.Dropout(params.dropout)#以droupout的概率丢弃输入
+        self.layers = nn.ModuleList([MiniMindBlock(l, params) for l in range(self.n_layers)])#每一层都是一个MiniMindBlock
+        self.norm = RMSNorm(params.dim, eps=params.norm_eps)#对dim个维度进行归一化，eps表示归一化时的epsilon
+        self.output = nn.Linear(params.dim, params.vocab_size, bias=False)#输出层，是一个全连接层，linear表示线性变换
+        self.tok_embeddings.weight = self.output.weight#输入embedding层和输出层的权重共享，tok表示token
         self.register_buffer("pos_cis",
                              precompute_pos_cis(dim=params.dim // params.n_heads, theta=params.rope_theta),
-                             persistent=False)
-        self.OUT = CausalLMOutputWithPast()
+                             persistent=False)#设置缓冲区，它不会被视为模型的可学习参数（即不会在反向传播中更新）
+        #缓冲区的名称是pos_cis pos表示位置，cis表示cosine，theta表示角度
+        # persistent=False表示缓冲区不会被保存到checkpoint中，即不会被保存到硬盘中
+        # precompute_pos_cis是自定义的函数，将嵌入维度除以头数，计算每个注意力头的维度
+        self.OUT = CausalLMOutputWithPast()#定义模型输出的数据结构,包含logits、past key values等信息
+        #causallm表示是自回归语言模型，output表示输出层，withpast表示包含past key values，过去的键值对
 
+# 前向传播
     def forward(self,
-                input_ids: Optional[torch.Tensor] = None,
-                past_key_values: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None,
+                input_ids: Optional[torch.Tensor] = None,# 输入的token id序列
+                past_key_values: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None,# KV缓存，是元组类型
                 use_cache: bool = False,
                 **args):
-        past_key_values = past_key_values or [None] * len(self.layers)
-        start_pos = args.get('start_pos', 0)
-        h = self.dropout(self.tok_embeddings(input_ids))
-        pos_cis = self.pos_cis[start_pos:start_pos + input_ids.size(1)]
+        past_key_values = past_key_values or [None] * len(self.layers)#每一层都有KV缓存
+        start_pos = args.get('start_pos', 0)#如果没有设置start_pos，则默认为0
+        h = self.dropout(self.tok_embeddings(input_ids))#先进行embedding，再进行dropout
+        pos_cis = self.pos_cis[start_pos:start_pos + input_ids.size(1)]#截取一段，从start_pos开始，长度等于当前输入序列的长度(序列的第二维大小)
         past_kvs = []
         for l, layer in enumerate(self.layers):
             h, past_kv = layer(
                 h, pos_cis,
                 past_key_value=past_key_values[l],
                 use_cache=use_cache
-            )
+            )#h（上一层的输出）和位置编码一起传入layer，然后输出h和past_kv
             past_kvs.append(past_kv)
-        logits = self.output(self.norm(h))
+        logits = self.output(self.norm(h))#最后一层做归一化，然后做线性变换
+        # 用于moe模式，辅助损失用于优化专家的负载均衡，防止某些专家被过度使用而其他专家闲置
+        # 遍历每一层，检查每一层的feed_forward，如果feed_forward是MOEFeedForward，则计算辅助损失
         aux_loss = sum(l.feed_forward.aux_loss for l in self.layers if isinstance(l.feed_forward, MOEFeedForward))
         self.OUT.__setitem__('logits', logits)
         self.OUT.__setitem__('aux_loss', aux_loss)
