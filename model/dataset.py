@@ -18,13 +18,22 @@ class PretrainDataset(Dataset):
         super().__init__()
         self.tokenizer = tokenizer
         self.max_length = max_length
-        self.samples = self.load_data(data_path)
+        self.samples = self.load_data(data_path)#samples是json对象的列表
 
     def load_data(self, path):
+        """
+        从JSONL文件中加载数据样本
+        
+        Args:
+            path (str): JSONL文件路径
+            
+        Returns:
+            list: 包含所有数据样本的列表，每个样本是一个JSON对象
+        """
         samples = []
         with open(path, 'r', encoding='utf-8') as f:
-            for line_num, line in enumerate(f, 1):
-                data = json.loads(line.strip())
+            for line_num, line in enumerate(f, 1):#获取行号和行内容，line_num从1开始
+                data = json.loads(line.strip())#把这一行用json.loads()方法解析成Python对象
                 samples.append(data)
         return samples
 
@@ -32,23 +41,27 @@ class PretrainDataset(Dataset):
         return len(self.samples)
 
     def __getitem__(self, index):
+        # 获取当前索引对应的样本数据
         sample = self.samples[index]
 
-        # 构建输入文本
+        # 构建输入文本：添加开始和结束标记
         text = f"{self.tokenizer.bos_token}{str(sample['text'])}{self.tokenizer.eos_token}"
+        # 使用tokenizer对文本进行编码，并进行长度限制和填充
         encoding = self.tokenizer(
             text,
             max_length=self.max_length,
-            padding='max_length',
-            truncation=True,
-            return_tensors='pt'
+            padding='max_length',  # 填充到max_length长度
+            truncation=True,       # 超长截断
+            return_tensors='pt'    # 返回PyTorch张量
         )
-        input_ids = encoding.input_ids.squeeze()
+        input_ids = encoding.input_ids.squeeze()#squeeze()去掉维度为1的维度
+        # 创建损失掩码，标记非填充位置
         loss_mask = (input_ids != self.tokenizer.pad_token_id)
 
+        # 构建训练数据：输入序列X(去掉最后一个token)、目标序列Y(去掉第一个token)
         X = torch.tensor(input_ids[:-1], dtype=torch.long)
         Y = torch.tensor(input_ids[1:], dtype=torch.long)
-        loss_mask = torch.tensor(loss_mask[1:], dtype=torch.long)
+        loss_mask = torch.tensor(loss_mask[1:], dtype=torch.long)#去掉第一个token，以便和Y对齐
         return X, Y, loss_mask
 
 

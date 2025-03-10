@@ -242,61 +242,93 @@ class MoEGate(nn.Module):
 class MOEFeedForward(nn.Module):
     def __init__(self, config: LMConfig):
         super().__init__()
+        # 初始化MoE模型配置
         self.config = config
+        # 创建路由专家列表，每个专家是一个前馈神经网络
         self.experts = nn.ModuleList([
             FeedForward(config)
             for _ in range(config.n_routed_experts)
-        ])
+        ])# 有n_routed_experts个，初始时刻每个都一样
+        # 创建MoE门控网络，用于选择专家
         self.gate = MoEGate(config)
+        # 如果配置了共享专家，则创建一个共享的前馈神经网络
         if config.n_shared_experts is not None:
             self.shared_experts = FeedForward(config)
 
     def forward(self, x):
-        identity = x
-        orig_shape = x.shape
+        """
+        混合专家模型(MoE)的前向传播函数
+        
+        Args:
+            x: torch.Tensor - 输入张量，形状为 [batch_size, seq_len, hidden_dim]
+            
+        Returns:
+            torch.Tensor - 经过专家处理后的输出张量，与输入形状相同
+            
+        实现逻辑:
+        1. 保存输入用于残差连接和形状恢复
+        2. 使用门控网络选择每个token应该由哪些专家处理
+        3. 根据训练/推理模式采用不同的专家调用策略
+        4. 如果配置了共享专家，则添加共享专家的输出
+        """
+        identity = x  # 保存输入用于残差连接
+        orig_shape = x.shape  # 记录原始形状用于后续恢复
         bsz, seq_len, _ = x.shape
-        # 使用门控机制选择专家
+        # 使用门控机制选择专家。把x输入gate，输出为专家索引，权重，辅助损失
         topk_idx, topk_weight, aux_loss = self.gate(x)
-        x = x.view(-1, x.shape[-1])
-        flat_topk_idx = topk_idx.view(-1)
+        x = x.view(-1, x.shape[-1])  # 将输入展平为二维张量，也就是batch_size * seq_len , hidden_dim
+        flat_topk_idx = topk_idx.view(-1)  # 将专家索引展平，原本的形状是batch_size * seq_len * num_experts_per_tok
         if self.training:
-            # 训练模式下，重复输入数据
-            x = x.repeat_interleave(self.config.num_experts_per_tok, dim=0)
-            y = torch.empty_like(x, dtype=torch.float16)
-            for i, expert in enumerate(self.experts):
-                y[flat_topk_idx == i] = expert(x[flat_topk_idx == i]).to(y.dtype)  # 确保类型一致
-            y = (y.view(*topk_weight.shape, -1) * topk_weight.unsqueeze(-1)).sum(dim=1)
-            y = y.view(*orig_shape)
+            # 训练模式下，重复输入数据以便并行处理多个专家
+            x = x.repeat_interleave(self.config.num_experts_per_tok, dim=0)#有多少个专家，就重复多少次
+            y = torch.empty_like(x, dtype=torch.float16)  # 创建输出张量，和x形状相同
+            for i, expert in enumerate(self.experts):#遍历每个专家，然后让输出中这个专家对应的值等于expert(x)
+                y[flat_topk_idx == i] = expert(x[flat_topk_idx == i]).to(y.dtype)  # flat_topk_idx == i确保只选择专家
+            # 让y的形状与 topk_weight 的形状相匹配，然后将结果与topk_weight相乘，再求和
+            y = (y.view(*topk_weight.shape, -1) * topk_weight.unsqueeze(-1)).sum(dim=1)  # 加权求和
+            y = y.view(*orig_shape)  # 恢复原始形状
         else:
-            # 推理模式下，只选择最优专家
+            # 推理模式下，只选择最优专家，使用专门的推理函数提高效率
             y = self.moe_infer(x, flat_topk_idx, topk_weight.view(-1, 1)).view(*orig_shape)
         if self.config.n_shared_experts is not None:
-            y = y + self.shared_experts(identity)
-        self.aux_loss = aux_loss
+            y = y + self.shared_experts(identity)  # 如果有共享专家，输入x得到输出
+        self.aux_loss = aux_loss  # 保存辅助损失用于优化专家负载均衡
         return y
 
-    @torch.no_grad()
+    @torch.no_grad()#不跟踪梯度
     def moe_infer(self, x, flat_expert_indices, flat_expert_weights):
-        expert_cache = torch.zeros_like(x)
-        idxs = flat_expert_indices.argsort()
-        tokens_per_expert = flat_expert_indices.bincount().cpu().numpy().cumsum(0)
-        token_idxs = idxs // self.config.num_experts_per_tok
+        """
+        混合专家模型(MoE)的推理函数，用于高效处理不同专家的token分配
+        
+        Args:
+            x: torch.Tensor - 输入张量，形状为 [batch_size*seq_len, hidden_dim]
+            flat_expert_indices: torch.Tensor - 展平的专家索引，指示每个token应由哪个专家处理
+            flat_expert_weights: torch.Tensor - 展平的专家权重，表示每个token对应专家的权重
+            
+        Returns:
+            torch.Tensor - 经过专家处理后的输出张量，与输入形状相同
+        """
+        expert_cache = torch.zeros_like(x)  # 创建与输入相同形状的零张量作为输出缓存
+        idxs = flat_expert_indices.argsort()  # 对专家索引进行排序，便于按专家分组处理
+        tokens_per_expert = flat_expert_indices.bincount().cpu().numpy().cumsum(0)  # 计算每个专家处理的token数量的累积和（例如[2,4,7）
+        token_idxs = idxs // self.config.num_experts_per_tok  # 计算每个专家索引对应的token索引
         # 例如当tokens_per_expert=[6, 15, 20, 26, 33, 38, 46, 52]
         # 当token_idxs=[3, 7, 19, 21, 24, 25,  4,  5,  6, 10, 11, 12...]
         # 意味着当token_idxs[:6] -> [3,  7, 19, 21, 24, 25,  4]位置的token都由专家0处理，token_idxs[6:15]位置的token都由专家1处理......
-        for i, end_idx in enumerate(tokens_per_expert):
-            start_idx = 0 if i == 0 else tokens_per_expert[i - 1]
-            if start_idx == end_idx:
+        for i, end_idx in enumerate(tokens_per_expert):#对于每个专家
+            start_idx = 0 if i == 0 else tokens_per_expert[i - 1]  # 确定当前专家处理的token范围起始位置,是 0 或者上一个专家处理的token数量
+            if start_idx == end_idx:  # 如果当前专家没有需要处理的token，则跳过
                 continue
-            expert = self.experts[i]
-            exp_token_idx = token_idxs[start_idx:end_idx]
-            expert_tokens = x[exp_token_idx]
-            expert_out = expert(expert_tokens).to(expert_cache.dtype)
-            expert_out.mul_(flat_expert_weights[idxs[start_idx:end_idx]])
-            # 使用 scatter_add_ 进行 sum 操作
+            expert = self.experts[i]  # 获取当前专家模型
+            exp_token_idx = token_idxs[start_idx:end_idx]  # 获取当前专家需要处理的token索引
+            expert_tokens = x[exp_token_idx]  # 提取需要当前专家处理的token
+            expert_out = expert(expert_tokens).to(expert_cache.dtype)  # 使用专家处理token并转换为缓存的数据类型
+            expert_out.mul_(flat_expert_weights[idxs[start_idx:end_idx]])  # 用mul函数将专家输出乘以对应的权重
+            # 使用 scatter_add_ 进行 sum 操作，将处理后的token放回对应位置
+            # 这里重复了batch_size * seq_len次，从而让每个token只被一个专家处理
             expert_cache.scatter_add_(0, exp_token_idx.view(-1, 1).repeat(1, x.shape[-1]), expert_out)
 
-        return expert_cache
+        return expert_cache  # 返回所有专家处理后的结果
 
 
 class MiniMindBlock(nn.Module):
