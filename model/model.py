@@ -184,6 +184,20 @@ class FeedForward(nn.Module):
 
 class MoEGate(nn.Module):
     def __init__(self, config: LMConfig):
+        """
+        MoE门控网络的初始化函数
+        
+        Args:
+            config: LMConfig - 模型配置参数对象
+            
+        初始化内容:
+            1. 设置每个token选择的专家数量(top_k)
+            2. 设置路由专家总数(n_routed_experts) 
+            3. 设置专家选择的评分函数(scoring_func)
+            4. 设置辅助损失相关参数(alpha, seq_aux)
+            5. 设置是否对top-k概率归一化(norm_topk_prob)
+            6. 初始化门控权重矩阵(weight)
+        """
         super().__init__()
         self.config = config
         self.top_k = config.num_experts_per_tok
@@ -194,46 +208,66 @@ class MoEGate(nn.Module):
         self.seq_aux = config.seq_aux
 
         self.norm_topk_prob = config.norm_topk_prob
-        self.gating_dim = config.dim
-        self.weight = nn.Parameter(torch.empty((self.n_routed_experts, self.gating_dim)))
+        self.gating_dim = config.dim #设置门控的维度
+        self.weight = nn.Parameter(torch.empty((self.n_routed_experts, self.gating_dim))) #矩阵形状为n_routed_experts*gating_dim
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
         import torch.nn.init as init
-        init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+        init.kaiming_uniform_(self.weight, a=math.sqrt(5)) #用kaiming_uniform_初始化    
 
     def forward(self, hidden_states):
+        """
+        MoE门控网络的前向传播函数
+        
+        Args:
+            hidden_states: torch.Tensor - 输入张量，形状为[batch_size, seq_len, hidden_dim]
+            
+        Returns:
+            Tuple[torch.Tensor, torch.Tensor, float]:
+            - topk_idx: 每个token选择的top-k个专家的索引
+            - topk_weight: 每个专家对应的权重
+            - aux_loss: 辅助损失，用于优化专家负载均衡
+            
+        实现逻辑:
+        1. 计算每个token与各个专家的相似度得分
+        2. 选择top-k个专家及其权重
+        3. 计算辅助损失以优化专家负载均衡
+        """
         bsz, seq_len, h = hidden_states.shape
-        hidden_states = hidden_states.view(-1, h)
-        logits = F.linear(hidden_states, self.weight, None)
+        hidden_states = hidden_states.view(-1, h)  # 展平为[batch_size*seq_len, hidden_dim]
+        logits = F.linear(hidden_states, self.weight, None)  # 构建一个线性模型，用于计算token与专家的相似度
         if self.scoring_func == 'softmax':
-            scores = logits.softmax(dim=-1)
+            scores = logits.softmax(dim=-1)  # 使用softmax将相似度转换为概率分布
         else:
             raise NotImplementedError(f'insupportable scoring function for MoE gating: {self.scoring_func}')
 
+        # 选择top-k个专家及其权重
         topk_weight, topk_idx = torch.topk(scores, k=self.top_k, dim=-1, sorted=False)
 
+        # 对top-k概率进行归一化
         if self.top_k > 1 and self.norm_topk_prob:
             denominator = topk_weight.sum(dim=-1, keepdim=True) + 1e-20
             topk_weight = topk_weight / denominator
 
+        # 如果是训练状态，则计算辅助损失
         if self.training and self.alpha > 0.0:
             scores_for_aux = scores
             aux_topk = self.top_k
-            topk_idx_for_aux_loss = topk_idx.view(bsz, -1)
-            if self.seq_aux:
-                scores_for_seq_aux = scores_for_aux.view(bsz, seq_len, -1)
-                ce = torch.zeros(bsz, self.n_routed_experts, device=hidden_states.device)
+            topk_idx_for_aux_loss = topk_idx.view(bsz, -1)# 形状为 (batch_size, seq_len * top_k)，表示每个输入token选择的专家索引
+            if self.seq_aux:  # 序列级别的辅助损失
+                scores_for_seq_aux = scores_for_aux.view(bsz, seq_len, -1)# 把分数转换成[batch_size, seq_len, top_k]
+                ce = torch.zeros(bsz, self.n_routed_experts, device=hidden_states.device)#形状为 (batch_size, num_experts) 的零张量，用于存储每个批次中每个专家的选择频率
                 ce.scatter_add_(1, topk_idx_for_aux_loss,
                                 torch.ones(bsz, seq_len * aux_topk, device=hidden_states.device)).div_(
-                    seq_len * aux_topk / self.n_routed_experts)
-                aux_loss = (ce * scores_for_seq_aux.mean(dim=1)).sum(dim=1).mean() * self.alpha
-            else:
-                mask_ce = F.one_hot(topk_idx_for_aux_loss.view(-1), num_classes=self.n_routed_experts)
-                ce = mask_ce.float().mean(0)
-                Pi = scores_for_aux.mean(0)
-                fi = ce * self.n_routed_experts
-                aux_loss = (Pi * fi).sum() * self.alpha
+                    seq_len * aux_topk / self.n_routed_experts)#先计算每个专家被选择的频率，再通过div_进行归一化
+                aux_loss = (ce * scores_for_seq_aux.mean(dim=1)).sum(dim=1).mean() * self.alpha #先得到每个专家的平均得分，再乘频率，再取平均值，再乘alpha进行缩放
+            else:  # token级别的辅助损失
+                mask_ce = F.one_hot(topk_idx_for_aux_loss.view(-1), num_classes=self.n_routed_experts)#形状为 (batch_size * seq_len * top_k, num_experts)
+                ce = mask_ce.float().mean(0)  # 计算每个专家的平均选择频率
+                Pi = scores_for_aux.mean(0)  # 计算每个专家的平均得分
+                fi = ce * self.n_routed_experts  # 计算专家的负载因子（等于平均选择频率乘以专家数量）
+                aux_loss = (Pi * fi).sum() * self.alpha  # 计算最终的辅助损失（等于专家得分乘以负载因子）
         else:
             aux_loss = 0
         return topk_idx, topk_weight, aux_loss
